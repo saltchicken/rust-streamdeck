@@ -1,5 +1,5 @@
 [package]
-name = "delete"
+name = "rust-streamdeck"
 version = "0.1.0"
 edition = "2024"
 

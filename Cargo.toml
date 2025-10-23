@@ -1,7 +1,10 @@
 [package]
-name = "rust-streamdeck"
+name = "delete"
 version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-hidapi = "2.6.3"
+elgato-streamdeck = { version = "0.12.0", features = ["async"] }
+tokio = { version = "1", features = ["full"] }
+image = "0.25.1"
+# hidapi = "2.6.3" # Only neeed for find_device.rs

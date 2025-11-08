@@ -1,19 +1,19 @@
 use elgato_streamdeck::{AsyncStreamDeck, DeviceStateUpdate, list_devices, new_hidapi};
 use image::open;
-use image::{DynamicImage, Rgb, imageops};
+use image::{DynamicImage, Rgb};
 use std::collections::HashMap;
 use std::io;
 use std::path::PathBuf;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
 
-// ‼️ Add imports for Time and FileSystem
 use std::fs;
 use std::time::{Duration, Instant};
 use tokio::process::Command;
 //
 const SOCKET_PATH: &str = "/tmp/rust-audio-monitor.sock";
 const PLAYBACK_SINK_NAME: Option<&str> = Some("MyMixer");
+// const PLAYBACK_SINK_NAME: Option<&str> = None;
 
 async fn play_audio_file(path: &PathBuf) -> io::Result<()> {
     let player = "pw-play"; // ‼️ Assumes pw-play is in your PATH
@@ -108,10 +108,11 @@ async fn main() {
                 device.clear_all_button_images().await.unwrap();
 
                 let mut button_files: HashMap<u8, PathBuf> = HashMap::new();
-                button_files.insert(0, PathBuf::from("/tmp/recording_A.wav"));
-                button_files.insert(1, PathBuf::from("/tmp/recording_B.wav"));
-                // button_files.insert(2, PathBuf::from("/tmp/recording_C.wav"));
-
+                for i in 0..8 {
+                    // This will create files like /tmp/recording_A.wav, /tmp/recording_B.wav, ... /tmp/recording_H.wav
+                    let file_name = format!("/tmp/recording_{}.wav", (b'A' + i) as char);
+                    button_files.insert(i, PathBuf::from(file_name));
+                }
                 let mut active_recording_key: Option<u8> = None;
                 let mut pending_delete: HashMap<u8, Instant> = HashMap::new();
 

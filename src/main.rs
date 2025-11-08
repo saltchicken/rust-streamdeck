@@ -3,6 +3,7 @@ use image::open;
 use image::{DynamicImage, Rgb, imageops};
 use std::collections::HashMap;
 use std::io;
+use std::path::PathBuf;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
 
@@ -45,6 +46,8 @@ async fn main() {
         open("src/rec_off.png").unwrap_or_else(|_| create_fallback_image(Rgb([80, 80, 80])));
     let img_rec_on =
         open("src/rec_on.png").unwrap_or_else(|_| create_fallback_image(Rgb([255, 0, 0])));
+    // ‼️ 1. Load the new "play" image
+    let img_play = open("src/play.png").unwrap_or_else(|_| create_fallback_image(Rgb([0, 255, 0]))); // Green fallback
 
     match new_hidapi() {
         Ok(hid) => {
@@ -66,15 +69,21 @@ async fn main() {
                 button_files.insert(1, "/tmp/recording_B.wav".to_string());
                 // button_files.insert(2, "/tmp/recording_C.wav".to_string());
 
-                // ‼️ This tracks which key, if any, is currently "live" (recording)
                 let mut active_recording_key: Option<u8> = None;
 
-                // Set initial button images to "off"
-                for key in button_files.keys() {
-                    device
-                        .set_button_image(*key, img_rec_off.clone())
-                        .await
-                        .unwrap();
+                // ‼️ 2. Set initial button images based on file existence
+                for (key, filename) in &button_files {
+                    let path = PathBuf::from(filename);
+                    let initial_image = if path.exists() {
+                        println!(
+                            "File {} exists, setting 'play' icon for button {}",
+                            filename, key
+                        );
+                        img_play.clone()
+                    } else {
+                        img_rec_off.clone()
+                    };
+                    device.set_button_image(*key, initial_image).await.unwrap();
                 }
 
                 device.flush().await.unwrap();
@@ -89,24 +98,31 @@ async fn main() {
                     for update in updates {
                         match update {
                             DeviceStateUpdate::ButtonDown(key) => {
-                                // ‼️ Only act if this is a mapped button
                                 if let Some(filename) = button_files.get(&key) {
                                     println!("Button {} down...", key);
 
-                                    // ‼️ 1. Check status first
+                                    // Check for file existence first
+                                    let path = PathBuf::from(filename);
+                                    if path.exists() {
+                                        eprintln!(
+                                            "File {} already exists. Ignoring press.",
+                                            filename
+                                        );
+                                        // ‼️ Button already shows "play", so we're done
+                                        continue;
+                                    }
+
+                                    // (Rest of the ButtonDown logic is unchanged)
                                     match send_audio_command("STATUS").await {
                                         Ok(status) => {
-                                            // ‼️ 2. Only start if listening
                                             if status.contains("Listening") {
                                                 println!(
                                                     "...Audio monitor is Listening. Sending START."
                                                 );
                                                 let cmd = format!("START {}", filename);
 
-                                                // ‼️ 3. Send START
                                                 match send_audio_command(&cmd).await {
                                                     Ok(_) => {
-                                                        // ‼️ 4. Mark this key as active
                                                         active_recording_key = Some(key);
                                                         device
                                                             .set_button_image(
@@ -126,7 +142,6 @@ async fn main() {
                                                     }
                                                 }
                                             } else {
-                                                // ‼️ Status was "Recording" or something else
                                                 println!(
                                                     "...Audio monitor is NOT Listening (Status: {}). Ignoring press.",
                                                     status
@@ -134,7 +149,6 @@ async fn main() {
                                             }
                                         }
                                         Err(e) => {
-                                            // ‼️ Failed to get status (socket down?)
                                             eprintln!(
                                                 "Failed to get STATUS: {}. Ignoring press.",
                                                 e
@@ -144,36 +158,39 @@ async fn main() {
                                 }
                             }
                             DeviceStateUpdate::ButtonUp(key) => {
-                                // ‼️ Exit if last button is pressed
                                 if key == device.kind().key_count() - 1 {
                                     println!("Exit button pressed. Shutting down.");
                                     break 'infinite;
                                 }
 
-                                // ‼️ 5. Only STOP if this *specific* key is the active one
                                 if active_recording_key == Some(key) {
                                     println!("Button {} up, sending STOP", key);
 
                                     match send_audio_command("STOP").await {
                                         Ok(_) => {
-                                            // ‼️ 6. Clear active key and reset image
                                             active_recording_key = None;
+
+                                            // ‼️ 3. On successful STOP, set image to "play"
                                             device
-                                                .set_button_image(key, img_rec_off.clone())
+                                                .set_button_image(key, img_play.clone())
                                                 .await
                                                 .unwrap();
-                                            println!("...STOPPED");
+                                            println!("...STOPPED. File saved.");
                                         }
                                         Err(e) => {
-                                            eprintln!("Failed to send STOP command: {}", e)
+                                            eprintln!(
+                                                "Failed to send STOP command: {}. Try releasing and pressing again.",
+                                                e
+                                            );
+                                            // ‼️ We don't clear active_recording_key,
+                                            // so the button stays red.
+                                            // Releasing and pressing again will retry the STOP.
                                         }
                                     }
                                     device.flush().await.unwrap();
                                 }
-                                // ‼️ If active_recording_key is None or a *different* key,
-                                // ‼️ this ButtonUp event is correctly ignored.
                             }
-                            _ => {} // Ignore other events
+                            _ => {}
                         }
                     }
                 }

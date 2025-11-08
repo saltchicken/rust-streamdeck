@@ -10,8 +10,39 @@ use tokio::net::UnixStream;
 // ‼️ Add imports for Time and FileSystem
 use std::fs;
 use std::time::{Duration, Instant};
-
+use tokio::process::Command;
+//
 const SOCKET_PATH: &str = "/tmp/rust-audio-monitor.sock";
+
+async fn play_audio_file(path: &PathBuf) -> io::Result<()> {
+    let player = "pw-play"; // ‼️ Assumes pw-play is in your PATH
+    println!(
+        "Attempting to play file with '{}': {}",
+        player,
+        path.display()
+    );
+
+    // Create the command
+    let mut cmd = Command::new(player);
+    cmd.arg(path);
+
+    // Run the command and wait for its status
+    // This runs in a spawned tokio task, so it won't block the UI
+    let status = cmd.status().await?;
+
+    if status.success() {
+        println!("Playback successful.");
+        Ok(())
+    } else {
+        // This will catch errors like "pw-play: command not found"
+        let msg = format!(
+            "Playback command '{}' failed with status: {}",
+            player, status
+        );
+        eprintln!("{}", msg);
+        Err(io::Error::new(io::ErrorKind::Other, msg))
+    }
+}
 
 // ... (send_audio_command function is unchanged) ...
 async fn send_audio_command(command: &str) -> io::Result<String> {
@@ -55,6 +86,7 @@ async fn main() {
     match new_hidapi() {
         Ok(hid) => {
             for (kind, serial) in list_devices(&hid) {
+                // ... (device setup and button mapping is unchanged) ...
                 println!(
                     "Found Stream Deck: {:?} {} {}",
                     kind,
@@ -67,18 +99,14 @@ async fn main() {
                 device.set_brightness(50).await.unwrap();
                 device.clear_all_button_images().await.unwrap();
 
-                // ‼️ Use PathBuf for cleaner file handling
                 let mut button_files: HashMap<u8, PathBuf> = HashMap::new();
                 button_files.insert(0, PathBuf::from("/tmp/recording_A.wav"));
                 button_files.insert(1, PathBuf::from("/tmp/recording_B.wav"));
                 // button_files.insert(2, PathBuf::from("/tmp/recording_C.wav"));
 
                 let mut active_recording_key: Option<u8> = None;
-
-                // ‼️ Stores the time a "play" button was pressed to check for long hold
                 let mut pending_delete: HashMap<u8, Instant> = HashMap::new();
 
-                // Set initial images based on file existence
                 for (key, path) in &button_files {
                     let initial_image = if path.exists() {
                         img_play.clone()
@@ -99,24 +127,21 @@ async fn main() {
 
                     for update in updates {
                         match update {
+                            // ... (ButtonDown logic is unchanged) ...
                             DeviceStateUpdate::ButtonDown(key) => {
                                 if let Some(path) = button_files.get(&key) {
-                                    // ‼️ Logic branch: file exists or not?
                                     if path.exists() {
-                                        // ‼️ 1. File exists: Start "pending delete" state
                                         println!(
                                             "Button {} down (file exists). Holding for delete...",
                                             key
                                         );
                                         pending_delete.insert(key, Instant::now());
-                                        // ‼️ Set image to "rec_on" to show "active/danger"
                                         device
                                             .set_button_image(key, img_rec_on.clone())
                                             .await
                                             .unwrap();
                                         device.flush().await.unwrap();
                                     } else {
-                                        // ‼️ 2. File doesn't exist: Start "record" logic
                                         println!(
                                             "Button {} down (no file). Checking status...",
                                             key
@@ -167,7 +192,7 @@ async fn main() {
                                     break 'infinite;
                                 }
 
-                                // ‼️ Check 1: Was this an active recording?
+                                // (Check 1: active_recording_key... unchanged)
                                 if active_recording_key == Some(key) {
                                     println!("Button {} up, (was recording), sending STOP", key);
                                     match send_audio_command("STOP").await {
@@ -185,7 +210,7 @@ async fn main() {
                                     }
                                     device.flush().await.unwrap();
 
-                                // ‼️ Check 2: Was this a pending delete?
+                                // (Check 2: pending_delete... MODIFIED)
                                 } else if let Some(start_time) = pending_delete.remove(&key) {
                                     let hold_duration = start_time.elapsed();
                                     println!(
@@ -194,7 +219,8 @@ async fn main() {
                                     );
 
                                     if hold_duration >= Duration::from_secs(2) {
-                                        // ‼️ Held for > 2s: Delete the file
+                                        // Held for > 2s: Delete the file
+                                        // (This delete logic is unchanged)
                                         if let Some(path) = button_files.get(&key) {
                                             match fs::remove_file(path) {
                                                 Ok(_) => {
@@ -210,7 +236,6 @@ async fn main() {
                                                         path.display(),
                                                         e
                                                     );
-                                                    // Set back to "play" as it still exists
                                                     device
                                                         .set_button_image(key, img_play.clone())
                                                         .await
@@ -219,8 +244,19 @@ async fn main() {
                                             }
                                         }
                                     } else {
-                                        // ‼️ Held for < 2s: Cancel delete
-                                        println!("...Hold < 2s. Delete canceled.");
+                                        // ‼️ Held for < 2s: Play the file
+                                        println!("...Hold < 2s. Triggering playback.");
+                                        if let Some(path) = button_files.get(&key) {
+                                            // ‼️ Spawn playback in a new task
+                                            // ‼️ so it doesn't block our event loop
+                                            let path_clone = path.clone();
+                                            tokio::spawn(async move {
+                                                if let Err(e) = play_audio_file(&path_clone).await {
+                                                    eprintln!("Playback failed: {}", e);
+                                                }
+                                            });
+                                        }
+                                        // ‼️ Set image back to "play"
                                         device
                                             .set_button_image(key, img_play.clone())
                                             .await
@@ -234,6 +270,7 @@ async fn main() {
                     }
                 }
                 drop(reader);
+                // ... (cleanup code unchanged) ...
                 println!("Cleaning up buttons...");
                 device.clear_all_button_images().await.unwrap();
                 device.flush().await.unwrap();

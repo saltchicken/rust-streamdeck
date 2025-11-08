@@ -13,6 +13,7 @@ use std::time::{Duration, Instant};
 use tokio::process::Command;
 //
 const SOCKET_PATH: &str = "/tmp/rust-audio-monitor.sock";
+const PLAYBACK_SINK_NAME: Option<&str> = Some("MyMixer");
 
 async fn play_audio_file(path: &PathBuf) -> io::Result<()> {
     let player = "pw-play"; // ‼️ Assumes pw-play is in your PATH
@@ -24,6 +25,13 @@ async fn play_audio_file(path: &PathBuf) -> io::Result<()> {
 
     // Create the command
     let mut cmd = Command::new(player);
+    if let Some(sink_name) = PLAYBACK_SINK_NAME {
+        cmd.arg("--target");
+        cmd.arg(sink_name);
+        println!("...routing playback to sink: {}", sink_name);
+    } else {
+        println!("...routing playback to default output.");
+    }
     cmd.arg(path);
 
     // Run the command and wait for its status

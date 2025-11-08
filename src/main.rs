@@ -7,6 +7,10 @@ use std::path::PathBuf;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
 
+// ‼️ Add imports for Time and FileSystem
+use std::fs;
+use std::time::{Duration, Instant};
+
 const SOCKET_PATH: &str = "/tmp/rust-audio-monitor.sock";
 
 // ... (send_audio_command function is unchanged) ...
@@ -46,8 +50,7 @@ async fn main() {
         open("src/rec_off.png").unwrap_or_else(|_| create_fallback_image(Rgb([80, 80, 80])));
     let img_rec_on =
         open("src/rec_on.png").unwrap_or_else(|_| create_fallback_image(Rgb([255, 0, 0])));
-    // ‼️ 1. Load the new "play" image
-    let img_play = open("src/play.png").unwrap_or_else(|_| create_fallback_image(Rgb([0, 255, 0]))); // Green fallback
+    let img_play = open("src/play.png").unwrap_or_else(|_| create_fallback_image(Rgb([0, 255, 0])));
 
     match new_hidapi() {
         Ok(hid) => {
@@ -64,21 +67,20 @@ async fn main() {
                 device.set_brightness(50).await.unwrap();
                 device.clear_all_button_images().await.unwrap();
 
-                let mut button_files: HashMap<u8, String> = HashMap::new();
-                button_files.insert(0, "/tmp/recording_A.wav".to_string());
-                button_files.insert(1, "/tmp/recording_B.wav".to_string());
-                // button_files.insert(2, "/tmp/recording_C.wav".to_string());
+                // ‼️ Use PathBuf for cleaner file handling
+                let mut button_files: HashMap<u8, PathBuf> = HashMap::new();
+                button_files.insert(0, PathBuf::from("/tmp/recording_A.wav"));
+                button_files.insert(1, PathBuf::from("/tmp/recording_B.wav"));
+                // button_files.insert(2, PathBuf::from("/tmp/recording_C.wav"));
 
                 let mut active_recording_key: Option<u8> = None;
 
-                // ‼️ 2. Set initial button images based on file existence
-                for (key, filename) in &button_files {
-                    let path = PathBuf::from(filename);
+                // ‼️ Stores the time a "play" button was pressed to check for long hold
+                let mut pending_delete: HashMap<u8, Instant> = HashMap::new();
+
+                // Set initial images based on file existence
+                for (key, path) in &button_files {
                     let initial_image = if path.exists() {
-                        println!(
-                            "File {} exists, setting 'play' icon for button {}",
-                            filename, key
-                        );
                         img_play.clone()
                     } else {
                         img_rec_off.clone()
@@ -98,61 +100,63 @@ async fn main() {
                     for update in updates {
                         match update {
                             DeviceStateUpdate::ButtonDown(key) => {
-                                if let Some(filename) = button_files.get(&key) {
-                                    println!("Button {} down...", key);
-
-                                    // Check for file existence first
-                                    let path = PathBuf::from(filename);
+                                if let Some(path) = button_files.get(&key) {
+                                    // ‼️ Logic branch: file exists or not?
                                     if path.exists() {
-                                        eprintln!(
-                                            "File {} already exists. Ignoring press.",
-                                            filename
+                                        // ‼️ 1. File exists: Start "pending delete" state
+                                        println!(
+                                            "Button {} down (file exists). Holding for delete...",
+                                            key
                                         );
-                                        // ‼️ Button already shows "play", so we're done
-                                        continue;
-                                    }
+                                        pending_delete.insert(key, Instant::now());
+                                        // ‼️ Set image to "rec_on" to show "active/danger"
+                                        device
+                                            .set_button_image(key, img_rec_on.clone())
+                                            .await
+                                            .unwrap();
+                                        device.flush().await.unwrap();
+                                    } else {
+                                        // ‼️ 2. File doesn't exist: Start "record" logic
+                                        println!(
+                                            "Button {} down (no file). Checking status...",
+                                            key
+                                        );
+                                        match send_audio_command("STATUS").await {
+                                            Ok(status) => {
+                                                if status.contains("Listening") {
+                                                    println!(
+                                                        "...Audio monitor is Listening. Sending START."
+                                                    );
+                                                    let cmd =
+                                                        format!("START {}", path.to_string_lossy());
 
-                                    // (Rest of the ButtonDown logic is unchanged)
-                                    match send_audio_command("STATUS").await {
-                                        Ok(status) => {
-                                            if status.contains("Listening") {
-                                                println!(
-                                                    "...Audio monitor is Listening. Sending START."
-                                                );
-                                                let cmd = format!("START {}", filename);
-
-                                                match send_audio_command(&cmd).await {
-                                                    Ok(_) => {
-                                                        active_recording_key = Some(key);
-                                                        device
-                                                            .set_button_image(
-                                                                key,
-                                                                img_rec_on.clone(),
-                                                            )
-                                                            .await
-                                                            .unwrap();
-                                                        device.flush().await.unwrap();
-                                                        println!("...STARTED");
+                                                    match send_audio_command(&cmd).await {
+                                                        Ok(_) => {
+                                                            active_recording_key = Some(key);
+                                                            device
+                                                                .set_button_image(
+                                                                    key,
+                                                                    img_rec_on.clone(),
+                                                                )
+                                                                .await
+                                                                .unwrap();
+                                                            device.flush().await.unwrap();
+                                                            println!("...STARTED");
+                                                        }
+                                                        Err(e) => {
+                                                            eprintln!("Failed to send START: {}", e)
+                                                        }
                                                     }
-                                                    Err(e) => {
-                                                        eprintln!(
-                                                            "Failed to send START command: {}",
-                                                            e
-                                                        );
-                                                    }
+                                                } else {
+                                                    println!(
+                                                        "...Audio monitor is NOT Listening (Status: {}).",
+                                                        status
+                                                    );
                                                 }
-                                            } else {
-                                                println!(
-                                                    "...Audio monitor is NOT Listening (Status: {}). Ignoring press.",
-                                                    status
-                                                );
                                             }
-                                        }
-                                        Err(e) => {
-                                            eprintln!(
-                                                "Failed to get STATUS: {}. Ignoring press.",
-                                                e
-                                            );
+                                            Err(e) => {
+                                                eprintln!("Failed to get STATUS: {}.", e)
+                                            }
                                         }
                                     }
                                 }
@@ -163,14 +167,12 @@ async fn main() {
                                     break 'infinite;
                                 }
 
+                                // ‼️ Check 1: Was this an active recording?
                                 if active_recording_key == Some(key) {
-                                    println!("Button {} up, sending STOP", key);
-
+                                    println!("Button {} up, (was recording), sending STOP", key);
                                     match send_audio_command("STOP").await {
                                         Ok(_) => {
                                             active_recording_key = None;
-
-                                            // ‼️ 3. On successful STOP, set image to "play"
                                             device
                                                 .set_button_image(key, img_play.clone())
                                                 .await
@@ -178,14 +180,51 @@ async fn main() {
                                             println!("...STOPPED. File saved.");
                                         }
                                         Err(e) => {
-                                            eprintln!(
-                                                "Failed to send STOP command: {}. Try releasing and pressing again.",
-                                                e
-                                            );
-                                            // ‼️ We don't clear active_recording_key,
-                                            // so the button stays red.
-                                            // Releasing and pressing again will retry the STOP.
+                                            eprintln!("Failed to send STOP: {}", e);
                                         }
+                                    }
+                                    device.flush().await.unwrap();
+
+                                // ‼️ Check 2: Was this a pending delete?
+                                } else if let Some(start_time) = pending_delete.remove(&key) {
+                                    let hold_duration = start_time.elapsed();
+                                    println!(
+                                        "Button {} up (was pending delete). Held for {:?}",
+                                        key, hold_duration
+                                    );
+
+                                    if hold_duration >= Duration::from_secs(2) {
+                                        // ‼️ Held for > 2s: Delete the file
+                                        if let Some(path) = button_files.get(&key) {
+                                            match fs::remove_file(path) {
+                                                Ok(_) => {
+                                                    println!("...File {} deleted.", path.display());
+                                                    device
+                                                        .set_button_image(key, img_rec_off.clone())
+                                                        .await
+                                                        .unwrap();
+                                                }
+                                                Err(e) => {
+                                                    eprintln!(
+                                                        "...Failed to delete file {}: {}",
+                                                        path.display(),
+                                                        e
+                                                    );
+                                                    // Set back to "play" as it still exists
+                                                    device
+                                                        .set_button_image(key, img_play.clone())
+                                                        .await
+                                                        .unwrap();
+                                                }
+                                            }
+                                        }
+                                    } else {
+                                        // ‼️ Held for < 2s: Cancel delete
+                                        println!("...Hold < 2s. Delete canceled.");
+                                        device
+                                            .set_button_image(key, img_play.clone())
+                                            .await
+                                            .unwrap();
                                     }
                                     device.flush().await.unwrap();
                                 }

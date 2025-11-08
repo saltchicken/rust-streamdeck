@@ -1,17 +1,14 @@
 use elgato_streamdeck::{AsyncStreamDeck, DeviceStateUpdate, list_devices, new_hidapi};
 use image::open;
-use image::{DynamicImage, Rgb, imageops}; // ‼️ For fallback images
-use std::collections::HashMap; // ‼️ To track button state
-use std::io; // ‼️ For our new IPC function
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader}; // ‼️ For IPC
-use tokio::net::UnixStream; // ‼️ The Unix Socket client
+use image::{DynamicImage, Rgb, imageops};
+use std::collections::HashMap;
+use std::io;
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::net::UnixStream;
 
-// ‼️ The path to the socket our audio monitor is listening on
 const SOCKET_PATH: &str = "/tmp/rust-audio-monitor.sock";
 
-// ‼️ This function connects to the socket, sends a command, and handles the connection.
-// ‼️ It's built to mimic `socat` by shutting down the write-half of the
-// ‼️ connection, which signals "End of File" (EOF) to the server's `read_line`.
+// ... (send_audio_command function is unchanged) ...
 async fn send_audio_command(command: &str) -> io::Result<String> {
     let stream = match UnixStream::connect(SOCKET_PATH).await {
         Ok(stream) => stream,
@@ -21,43 +18,33 @@ async fn send_audio_command(command: &str) -> io::Result<String> {
             return Err(io::Error::new(io::ErrorKind::ConnectionRefused, msg));
         }
     };
-
-    // ‼️ Split the stream so we can shut down writing after we send
     let (mut reader, mut writer) = stream.into_split();
-
-    // ‼️ Send the command (with a newline!)
     let cmd_with_newline = format!("{}\n", command);
     if let Err(e) = writer.write_all(cmd_with_newline.as_bytes()).await {
         eprintln!("Failed to write command: {}", e);
         return Err(e.into());
     }
-
-    // ‼️ Shut down the write-half. This is crucial.
     if let Err(e) = writer.shutdown().await {
         eprintln!("Failed to shutdown writer: {}", e);
         return Err(e.into());
     }
-
-    // ‼️ Read the response back (e.g., for "STATUS")
     let mut response = String::new();
     let mut buf_reader = BufReader::new(reader);
     buf_reader.read_line(&mut response).await?;
-
     Ok(response.trim().to_string())
 }
 
-// ‼️ Helper to create a fallback image if one isn't found
+// ... (create_fallback_image function is unchanged) ...
 fn create_fallback_image(color: Rgb<u8>) -> DynamicImage {
     DynamicImage::ImageRgb8(image::RgbImage::from_fn(72, 72, move |_, _| color))
 }
 
 #[tokio::main]
 async fn main() {
-    // ‼️ Load our button icons. Provides a fallback if not found.
     let img_rec_off =
-        open("src/rec_off.png").unwrap_or_else(|_| create_fallback_image(Rgb([80, 80, 80]))); // Dark gray
+        open("src/rec_off.png").unwrap_or_else(|_| create_fallback_image(Rgb([80, 80, 80])));
     let img_rec_on =
-        open("src/rec_on.png").unwrap_or_else(|_| create_fallback_image(Rgb([255, 0, 0]))); // Bright red
+        open("src/rec_on.png").unwrap_or_else(|_| create_fallback_image(Rgb([255, 0, 0])));
 
     match new_hidapi() {
         Ok(hid) => {
@@ -74,23 +61,20 @@ async fn main() {
                 device.set_brightness(50).await.unwrap();
                 device.clear_all_button_images().await.unwrap();
 
-                // ‼️ Map button keys to their recording filenames
                 let mut button_files: HashMap<u8, String> = HashMap::new();
                 button_files.insert(0, "/tmp/recording_A.wav".to_string());
                 button_files.insert(1, "/tmp/recording_B.wav".to_string());
-                // ‼️ Add more buttons here
                 // button_files.insert(2, "/tmp/recording_C.wav".to_string());
 
-                // ‼️ Track the recording state (true = recording)
-                let mut button_states: HashMap<u8, bool> = HashMap::new();
+                // ‼️ This tracks which key, if any, is currently "live" (recording)
+                let mut active_recording_key: Option<u8> = None;
 
-                // ‼️ Set initial button images to "off"
+                // Set initial button images to "off"
                 for key in button_files.keys() {
                     device
                         .set_button_image(*key, img_rec_off.clone())
                         .await
                         .unwrap();
-                    button_states.insert(*key, false); // ‼️ Init state
                 }
 
                 device.flush().await.unwrap();
@@ -105,65 +89,98 @@ async fn main() {
                     for update in updates {
                         match update {
                             DeviceStateUpdate::ButtonDown(key) => {
-                                println!("Button {} down", key);
+                                // ‼️ Only act if this is a mapped button
+                                if let Some(filename) = button_files.get(&key) {
+                                    println!("Button {} down...", key);
+
+                                    // ‼️ 1. Check status first
+                                    match send_audio_command("STATUS").await {
+                                        Ok(status) => {
+                                            // ‼️ 2. Only start if listening
+                                            if status.contains("Listening") {
+                                                println!(
+                                                    "...Audio monitor is Listening. Sending START."
+                                                );
+                                                let cmd = format!("START {}", filename);
+
+                                                // ‼️ 3. Send START
+                                                match send_audio_command(&cmd).await {
+                                                    Ok(_) => {
+                                                        // ‼️ 4. Mark this key as active
+                                                        active_recording_key = Some(key);
+                                                        device
+                                                            .set_button_image(
+                                                                key,
+                                                                img_rec_on.clone(),
+                                                            )
+                                                            .await
+                                                            .unwrap();
+                                                        device.flush().await.unwrap();
+                                                        println!("...STARTED");
+                                                    }
+                                                    Err(e) => {
+                                                        eprintln!(
+                                                            "Failed to send START command: {}",
+                                                            e
+                                                        );
+                                                    }
+                                                }
+                                            } else {
+                                                // ‼️ Status was "Recording" or something else
+                                                println!(
+                                                    "...Audio monitor is NOT Listening (Status: {}). Ignoring press.",
+                                                    status
+                                                );
+                                            }
+                                        }
+                                        Err(e) => {
+                                            // ‼️ Failed to get status (socket down?)
+                                            eprintln!(
+                                                "Failed to get STATUS: {}. Ignoring press.",
+                                                e
+                                            );
+                                        }
+                                    }
+                                }
                             }
                             DeviceStateUpdate::ButtonUp(key) => {
-                                println!("Button {} up", key);
-
                                 // ‼️ Exit if last button is pressed
                                 if key == device.kind().key_count() - 1 {
+                                    println!("Exit button pressed. Shutting down.");
                                     break 'infinite;
                                 }
 
-                                // ‼️ Check if this is a button we've assigned a file to
-                                if let Some(filename) = button_files.get(&key) {
-                                    let is_recording = button_states.entry(key).or_insert(false);
+                                // ‼️ 5. Only STOP if this *specific* key is the active one
+                                if active_recording_key == Some(key) {
+                                    println!("Button {} up, sending STOP", key);
 
-                                    if *is_recording {
-                                        // ‼️ We are recording, so send STOP
-                                        println!("...is recording, sending STOP");
-                                        match send_audio_command("STOP").await {
-                                            Ok(_) => {
-                                                *is_recording = false; // Update state
-                                                // ‼️ Set image to OFF
-                                                device
-                                                    .set_button_image(key, img_rec_off.clone())
-                                                    .await
-                                                    .unwrap();
-                                                println!("...STOPPED");
-                                            }
-                                            Err(e) => {
-                                                eprintln!("Failed to send STOP command: {}", e)
-                                            }
+                                    match send_audio_command("STOP").await {
+                                        Ok(_) => {
+                                            // ‼️ 6. Clear active key and reset image
+                                            active_recording_key = None;
+                                            device
+                                                .set_button_image(key, img_rec_off.clone())
+                                                .await
+                                                .unwrap();
+                                            println!("...STOPPED");
                                         }
-                                    } else {
-                                        // ‼️ Not recording, so send START
-                                        let cmd = format!("START {}", filename);
-                                        println!("...sending START for {}", filename);
-                                        match send_audio_command(&cmd).await {
-                                            Ok(_) => {
-                                                *is_recording = true; // Update state
-                                                // ‼️ Set image to ON
-                                                device
-                                                    .set_button_image(key, img_rec_on.clone())
-                                                    .await
-                                                    .unwrap();
-                                                println!("...STARTED");
-                                            }
-                                            Err(e) => {
-                                                eprintln!("Failed to send START command: {}", e)
-                                            }
+                                        Err(e) => {
+                                            eprintln!("Failed to send STOP command: {}", e)
                                         }
                                     }
-                                    device.flush().await.unwrap(); // ‼️ Flush image change
+                                    device.flush().await.unwrap();
                                 }
+                                // ‼️ If active_recording_key is None or a *different* key,
+                                // ‼️ this ButtonUp event is correctly ignored.
                             }
-                            // ... (other device states are ignored for this example)
-                            _ => {}
+                            _ => {} // Ignore other events
                         }
                     }
                 }
                 drop(reader);
+                println!("Cleaning up buttons...");
+                device.clear_all_button_images().await.unwrap();
+                device.flush().await.unwrap();
             }
         }
         Err(e) => eprintln!("Failed to create HidApi instance: {}", e),

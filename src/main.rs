@@ -7,9 +7,11 @@ use std::path::PathBuf;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
 
+use std::env;
 use std::fs;
+use std::process::Stdio;
 use std::time::{Duration, Instant};
-use tokio::process::Command;
+use tokio::process::{Child, Command};
 //
 const SOCKET_PATH: &str = "/tmp/rust-audio-monitor.sock";
 const PLAYBACK_SINK_NAME: Option<&str> = Some("MyMixer");
@@ -85,6 +87,46 @@ fn create_fallback_image(color: Rgb<u8>) -> DynamicImage {
 
 #[tokio::main]
 async fn main() {
+    // ‼️ --- START OF NEW PROCESS SPAWNING CODE ---
+    // 1. Find the path to our own executable
+    let mut server_exe_path = match env::current_exe() {
+        Ok(path) => path,
+        Err(e) => {
+            eprintln!("Failed to get current executable path: {}", e);
+            return;
+        }
+    };
+
+    // 2. Get the directory (e.g., /path/to/project/target/debug/)
+    server_exe_path.pop();
+
+    // 3. Append the name of the *other* binary
+    //    (On Windows, you'd need to add ".exe" here)
+    server_exe_path.push("pipewire_source");
+
+    println!(
+        "Attempting to spawn server at: {}",
+        server_exe_path.display()
+    );
+
+    // 4. Spawn the pipewire_source binary as a child process
+    let mut server_process: Child = Command::new(&server_exe_path)
+        .stdout(Stdio::null()) // Silences the server's stdout
+        .stderr(Stdio::null()) // Silences the server's stderr
+        .spawn()
+        .expect("Failed to spawn pipewire_source server. Did you `cargo build` first?");
+
+    let server_pid = server_process.id().unwrap_or(0);
+    println!(
+        "Spawned server process (PID: {}). Waiting for it to initialize...",
+        server_pid
+    );
+
+    // 5. Give the server a moment to start and create the socket.
+    //    A more robust way is a retry-loop on connect, but this is simpler.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    // ‼️ --- END OF NEW PROCESS SPAWNING CODE ---
+
     let img_rec_off =
         open("src/rec_off.png").unwrap_or_else(|_| create_fallback_image(Rgb([80, 80, 80])));
     let img_rec_on =
@@ -287,4 +329,6 @@ async fn main() {
         }
         Err(e) => eprintln!("Failed to create HidApi instance: {}", e),
     }
+    println!("Main function exiting. Ensuring server is killed.");
+    let _ = server_process.kill().await;
 }

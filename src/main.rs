@@ -1,12 +1,34 @@
 use image::open;
 use std::time::Duration;
 
-use elgato_streamdeck::images::{ImageRect, convert_image_with_format};
-use elgato_streamdeck::{AsyncStreamDeck, DeviceStateUpdate, list_devices, new_hidapi};
+use elgato_streamdeck::images::{convert_image_with_format, ImageRect};
+use elgato_streamdeck::{list_devices, new_hidapi, AsyncStreamDeck, DeviceStateUpdate};
+use midir::os::unix::VirtualOutput;
+use midir::MidiOutput;
 use tokio::time::sleep;
 
 #[tokio::main]
 async fn main() {
+    // 1. Initialize MIDI output
+    let midi_out = MidiOutput::new("Stream Deck MIDI").expect("Failed to create MIDI output");
+    
+    // On Linux/macOS, we can create a virtual MIDI device DAWs can connect to.
+    #[cfg(not(target_os = "windows"))]
+    let mut midi_conn = midi_out
+        .create_virtual("StreamDeck Encoders")
+        .expect("Failed to create virtual MIDI port");
+
+    // On Windows, virtual ports aren't natively supported by midir, so we connect to the first available port.
+    #[cfg(target_os = "windows")]
+    let mut midi_conn = {
+        let ports = midi_out.ports();
+        let port = ports.first().expect("No MIDI output ports found. Please install a loopback driver like loopMIDI.");
+        midi_out.connect(port, "StreamDeck Encoders").expect("Failed to connect to MIDI port")
+    };
+
+    // Array to track the current 0-127 values of the encoders. We'll default them to 64 (center).
+    let mut encoder_values = [64u8; 8];
+
     // Create instance of HidApi
     match new_hidapi() {
         Ok(hid) => {
@@ -56,9 +78,7 @@ async fn main() {
                     Some((w, h)) => {
                         let min = w.min(h) as u32;
                         let scaled_image =
-                            image
-                                .clone()
-                                .resize_to_fill(min, min, image::imageops::Nearest);
+                            image.clone().resize_to_fill(min, min, image::imageops::Nearest);
                         Some(ImageRect::from_image(scaled_image).unwrap())
                     }
                     None => None,
@@ -115,7 +135,24 @@ async fn main() {
                                 }
                             }
                             DeviceStateUpdate::EncoderTwist(dial, ticks) => {
-                                println!("Dial {} twisted by {}", dial, ticks);
+                                // Calculate the new CC value using the tick delta, clamping to MIDI bounds
+                                let dial_idx = dial as usize;
+                                let current_val = encoder_values[dial_idx] as i32;
+                                let new_val = (current_val + ticks as i32).clamp(0, 127) as u8;
+                                
+                                // Save state
+                                encoder_values[dial_idx] = new_val;
+                                
+                                // Send MIDI CC message
+                                // Status byte 0xB0 = Control Change on MIDI Channel 1
+                                // We offset the CC number by 16 so dial 0 -> CC 16, dial 1 -> CC 17, etc.
+                                let cc_number = 16 + dial as u8;
+                                
+                                if let Err(e) = midi_conn.send(&[0xB0, cc_number, new_val]) {
+                                    eprintln!("Failed to send MIDI message: {}", e);
+                                }
+                                
+                                println!("Dial {} twisted by {}. Sent CC {}: {}", dial, ticks, cc_number, new_val);
                             }
                             DeviceStateUpdate::EncoderDown(dial) => {
                                 println!("Dial {} down", dial);
@@ -155,4 +192,3 @@ async fn main() {
         Err(e) => eprintln!("Failed to create HidApi instance: {}", e),
     }
 }
-

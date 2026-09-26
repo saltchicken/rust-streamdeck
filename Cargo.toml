@@ -7,4 +7,5 @@ edition = "2024"
 elgato-streamdeck = { version = "0.12.0", features = ["async"] }
 tokio = { version = "1", features = ["full"] }
 image = "0.25.1"
+midir = "0.10.0" # Added for MIDI output
 # hidapi = "2.6.3" # Only neeed for find_device.rs

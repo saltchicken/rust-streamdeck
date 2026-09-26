@@ -1,11 +1,7 @@
-use image::open;
-use std::time::Duration;
-
-use elgato_streamdeck::images::{convert_image_with_format, ImageRect};
 use elgato_streamdeck::{list_devices, new_hidapi, AsyncStreamDeck, DeviceStateUpdate};
+use elgato_streamdeck::images::convert_image_with_format;
 use midir::os::unix::VirtualOutput;
 use midir::MidiOutput;
-use tokio::time::sleep;
 
 #[tokio::main]
 async fn main() {
@@ -47,74 +43,32 @@ async fn main() {
                 );
 
                 device.set_brightness(50).await.unwrap();
+                
+                // 1. Clear all physical buttons (makes them black)
                 device.clear_all_button_images().await.unwrap();
 
-                // Use image-rs to load an image
-                let image = open("src/no-place-like-localhost.jpg").unwrap();
-                let alternative = image.grayscale().brighten(-50);
-
-                println!("Key count: {}", kind.key_count());
-                // Write it to the device
-                for i in 0..kind.key_count() {
-                    device.set_button_image(i, image.clone()).await.unwrap();
-                }
-
-                println!("Touch point count: {}", kind.touchpoint_count());
-                for i in 0..kind.touchpoint_count() {
-                    device.set_touchpoint_color(i, 255, 255, 255).await.unwrap();
-                }
-
+                // 2. Clear the LCD Screen (Stream Deck +) by filling it with a black image
                 if let Some(format) = device.kind().lcd_image_format() {
-                    let scaled_image = image.clone().resize_to_fill(
+                    // Create a completely black image matching the exact dimensions of the screen
+                    let black_image = image::DynamicImage::ImageRgb8(image::RgbImage::new(
                         format.size.0 as u32,
                         format.size.1 as u32,
-                        image::imageops::FilterType::Nearest,
-                    );
-                    let converted_image = convert_image_with_format(format, scaled_image).unwrap();
+                    ));
+                    
+                    let converted_image = convert_image_with_format(format, black_image).unwrap();
                     let _ = device.write_lcd_fill(&converted_image).await;
                 }
 
-                let small = match device.kind().lcd_strip_size() {
-                    Some((w, h)) => {
-                        let min = w.min(h) as u32;
-                        let scaled_image =
-                            image.clone().resize_to_fill(min, min, image::imageops::Nearest);
-                        Some(ImageRect::from_image(scaled_image).unwrap())
-                    }
-                    None => None,
-                };
+                println!("Key count: {}", kind.key_count());
+                println!("Touch point count: {}", kind.touchpoint_count());
+                
+                // 3. Ensure touch display zones are set to black
+                for i in 0..kind.touchpoint_count() {
+                    device.set_touchpoint_color(i, 0, 0, 0).await.unwrap();
+                }
 
-                // Flush
+                // Flush the black/clear state to the device
                 device.flush().await.unwrap();
-
-                // Start new task to animate the button images
-                let device_clone = device.clone();
-                tokio::spawn(async move {
-                    let mut index = 0;
-                    let mut previous = 0;
-
-                    loop {
-                        device_clone
-                            .set_button_image(index, image.clone())
-                            .await
-                            .unwrap();
-                        device_clone
-                            .set_button_image(previous, alternative.clone())
-                            .await
-                            .unwrap();
-
-                        device_clone.flush().await.unwrap();
-
-                        sleep(Duration::from_secs_f32(0.5)).await;
-
-                        previous = index;
-
-                        index += 1;
-                        if index >= kind.key_count() {
-                            index = 0;
-                        }
-                    }
-                });
 
                 let reader = device.get_reader();
 
@@ -170,9 +124,6 @@ async fn main() {
 
                             DeviceStateUpdate::TouchScreenPress(x, y) => {
                                 println!("Touch Screen press at {x}, {y}");
-                                if let Some(small) = &small {
-                                    device.write_lcd(x, y, small).await.unwrap();
-                                }
                             }
 
                             DeviceStateUpdate::TouchScreenLongPress(x, y) => {
